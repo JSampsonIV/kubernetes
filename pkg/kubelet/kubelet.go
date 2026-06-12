@@ -104,6 +104,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/kuberuntime"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/logs"
+	"k8s.io/kubernetes/pkg/kubelet/managed"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
 	"k8s.io/kubernetes/pkg/kubelet/network/dns"
@@ -122,6 +123,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/server"
 	servermetrics "k8s.io/kubernetes/pkg/kubelet/server/metrics"
 	serverstats "k8s.io/kubernetes/pkg/kubelet/server/stats"
+	"k8s.io/kubernetes/pkg/kubelet/sharedcpus"
 	"k8s.io/kubernetes/pkg/kubelet/stats"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	"k8s.io/kubernetes/pkg/kubelet/sysctl"
@@ -188,10 +190,6 @@ const (
 	// the expected length between housekeeping periods, which explicitly refreshes
 	// the cache.
 	runtimeCacheRefreshPeriod = housekeepingPeriod + housekeepingWarningDuration
-
-	// Period for performing eviction monitoring.
-	// ensure this is kept in sync with internal cadvisor housekeeping.
-	evictionMonitoringPeriod = time.Second * 10
 
 	// The path in containers' filesystems where the hosts file is mounted.
 	linuxEtcHostsPath   = "/etc/hosts"
@@ -270,7 +268,20 @@ var (
 
 	// This is exposed for unit tests.
 	goos = sysruntime.GOOS
+
+	// Period for performing eviction monitoring.
+	// ensure this is kept in sync with internal cadvisor housekeeping.
+	evictionMonitoringPeriod = time.Second * 10
 )
+
+func init() {
+	if value := os.Getenv("OPENSHIFT_EVICTION_MONITORING_PERIOD_DURATION"); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			klog.Infof("Detected OPENSHIFT_EVICTION_MONITORING_PERIOD_DURATION: %v", value)
+			evictionMonitoringPeriod = duration
+		}
+	}
+}
 
 func getContainerEtcHostsPath() string {
 	if goos == "windows" {
@@ -705,6 +716,13 @@ func NewMainKubelet(ctx context.Context,
 	klet.resourceAnalyzer = serverstats.NewResourceAnalyzer(ctx, klet, kubeCfg.VolumeStatsAggPeriod.Duration, kubeDeps.Recorder)
 
 	klet.runtimeService = kubeDeps.RemoteRuntimeService
+
+	if managed.IsEnabled() {
+		klog.InfoS("Pinned Workload Management Enabled")
+	}
+	if sharedcpus.IsEnabled() {
+		klog.InfoS("Mixed CPUs Workload Enabled")
+	}
 
 	if kubeDeps.KubeClient != nil {
 		klet.runtimeClassManager = runtimeclass.NewManager(kubeDeps.KubeClient)
@@ -1786,16 +1804,13 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 					http.Error(w, errs.ToAggregate().Error(), http.StatusBadRequest)
 					return
 				} else if nlq != nil {
-					if req.URL.Path != "/" && req.URL.Path != "" {
-						http.Error(w, "path not allowed in query mode", http.StatusNotAcceptable)
-						return
-					}
 					if errs := nlq.validate(); len(errs) > 0 {
 						http.Error(w, errs.ToAggregate().Error(), http.StatusNotAcceptable)
 						return
 					}
 					// Validation ensures that the request does not query services and files at the same time
-					if len(nlq.Services) > 0 {
+					// OCP: Presence of journal in the path indicates it is a query for service(s)
+					if len(nlq.Services) > 0 || req.URL.Path == "journal" || req.URL.Path == "journal/" {
 						journal.ServeHTTP(w, req)
 						return
 					}
