@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/flagz"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/mux"
@@ -81,6 +82,8 @@ import (
 	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 	garbagecollector "k8s.io/kubernetes/pkg/controller/garbagecollector"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
+
+	libgorestclient "github.com/openshift/library-go/pkg/config/client"
 )
 
 func init() {
@@ -133,9 +136,19 @@ controller, and serviceaccounts controller.`,
 			}
 			cliflag.PrintFlags(cmd.Flags())
 
+			if err := SetUpCustomRoundTrippersForOpenShift(s); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+
 			ctx := context.Background()
 			c, err := s.Config(ctx, KnownControllers(), ControllersDisabledByDefault(), ControllerAliases())
 			if err != nil {
+				return err
+			}
+
+			if err := ShimForOpenShift(s, c); err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
 				return err
 			}
 
@@ -144,7 +157,8 @@ controller, and serviceaccounts controller.`,
 			fg.(featuregate.MutableFeatureGate).AddMetrics()
 			// add component version metrics
 			s.ComponentGlobalsRegistry.AddMetrics()
-			return Run(ctx, c.Complete())
+			stopCh := server.SetupSignalHandler()
+			return Run(context.Background(), c.Complete(), stopCh)
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
 			for _, arg := range args {
@@ -181,9 +195,9 @@ func ResyncPeriod(c *config.CompletedConfig) func() time.Duration {
 }
 
 // Run runs the KubeControllerManagerOptions.
-func Run(ctx context.Context, c *config.CompletedConfig) error {
+func Run(ctx context.Context, c *config.CompletedConfig, stopCh2 <-chan struct{}) error {
 	logger := klog.FromContext(ctx)
-	stopCh := ctx.Done()
+	stopCh := mergeCh(ctx.Done(), stopCh2)
 
 	// To help debugging, immediately log version
 	logger.Info("Starting", "version", utilversion.Get())
@@ -199,6 +213,17 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 		cfgz.Set(c.ComponentConfig)
 	} else {
 		logger.Error(err, "Unable to register configz")
+	}
+
+	// start the localhost health monitor early so that it can be used by the LE client
+	if c.OpenShiftContext.PreferredHostHealthMonitor != nil {
+		hmCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			<-stopCh
+			cancel()
+		}()
+		go c.OpenShiftContext.PreferredHostHealthMonitor.Run(hmCtx)
 	}
 
 	// Setup any healthz checks we will want to use.
@@ -365,10 +390,18 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 				run(ctx, controllerDescriptors)
 			},
 			OnStoppedLeading: func() {
-				logger.Error(nil, "leaderelection lost")
-				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+				select {
+				case <-stopCh:
+					// We were asked to terminate. Exit 0.
+					klog.Info("Requested to terminate. Exiting.")
+					os.Exit(0)
+				default:
+					// We lost the lock.
+					logger.Error(nil, "leaderelection lost")
+					klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+				}
 			},
-		})
+		}, stopCh)
 
 	// If Leader Migration is enabled, proceed to attempt the migration lock.
 	if leaderMigrator != nil {
@@ -392,10 +425,18 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 					run(ctx, controllerDescriptors)
 				},
 				OnStoppedLeading: func() {
-					logger.Error(nil, "migration leaderelection lost")
-					klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+					select {
+					case <-stopCh:
+						// We were asked to terminate. Exit 0.
+						klog.Info("Requested to terminate. Exiting.")
+						os.Exit(0)
+					default:
+						// We lost the lock.
+						logger.Error(nil, "migration leaderelection lost")
+						klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+					}
 				},
-			})
+			}, stopCh)
 	}
 
 	<-stopCh
@@ -404,6 +445,8 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 
 // ControllerContext defines the context object for controller
 type ControllerContext struct {
+	OpenShiftContext config.OpenShiftContext
+
 	// ClientBuilder will provide a client for this controller to use
 	ClientBuilder clientbuilder.ControllerClientBuilder
 
@@ -486,7 +529,12 @@ func CreateControllerContext(ctx context.Context, s *config.CompletedConfig, roo
 		return ControllerContext{}, fmt.Errorf("failed to create Kubernetes client for %q: %w", "shared-informers", err)
 	}
 
-	sharedInformers := informers.NewSharedInformerFactoryWithOptions(versionedClient, ResyncPeriod(s)(), informers.WithTransform(trim))
+	var sharedInformers informers.SharedInformerFactory
+	if InformerFactoryOverride == nil {
+		sharedInformers = informers.NewSharedInformerFactoryWithOptions(versionedClient, ResyncPeriod(s)(), informers.WithTransform(trim))
+	} else {
+		sharedInformers = InformerFactoryOverride
+	}
 
 	metadataConfig, err := rootClientBuilder.Config("metadata-informers")
 	if err != nil {
@@ -519,6 +567,7 @@ func CreateControllerContext(ctx context.Context, s *config.CompletedConfig, roo
 	}, 30*time.Second, ctx.Done())
 
 	controllerContext := ControllerContext{
+		OpenShiftContext:                s.OpenShiftContext,
 		ClientBuilder:                   clientBuilder,
 		InformerFactory:                 sharedInformers,
 		ObjectOrMetadataInformerFactory: informerfactory.NewInformerFactory(sharedInformers, metadataInformers),
@@ -764,7 +813,7 @@ func createClientBuilders(c *config.CompletedConfig) (clientBuilder clientbuilde
 	if c.ComponentConfig.KubeCloudShared.UseServiceAccountCredentials {
 
 		clientBuilder = clientbuilder.NewDynamicClientBuilder(
-			restclient.AnonymousClientConfig(c.Kubeconfig),
+			libgorestclient.AnonymousClientConfigWithWrapTransport(c.Kubeconfig),
 			c.Client.CoreV1(),
 			metav1.NamespaceSystem)
 	} else {
@@ -775,7 +824,7 @@ func createClientBuilders(c *config.CompletedConfig) (clientBuilder clientbuilde
 
 // leaderElectAndRun runs the leader election, and runs the callbacks once the leader lease is acquired.
 // TODO: extract this function into staging/controller-manager
-func leaderElectAndRun(ctx context.Context, c *config.CompletedConfig, lockIdentity string, electionChecker *leaderelection.HealthzAdaptor, resourceLock string, leaseName string, callbacks leaderelection.LeaderCallbacks) {
+func leaderElectAndRun(ctx context.Context, c *config.CompletedConfig, lockIdentity string, electionChecker *leaderelection.HealthzAdaptor, resourceLock string, leaseName string, callbacks leaderelection.LeaderCallbacks, stopCh <-chan struct{}) {
 	logger := klog.FromContext(ctx)
 	rl, err := resourcelock.NewFromKubeconfig(resourceLock,
 		c.ComponentConfig.Generic.LeaderElection.ResourceNamespace,
@@ -791,7 +840,13 @@ func leaderElectAndRun(ctx context.Context, c *config.CompletedConfig, lockIdent
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+	leCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-stopCh
+		cancel()
+	}()
+	leaderelection.RunOrDie(leCtx, leaderelection.LeaderElectionConfig{
 		Lock:          rl,
 		LeaseDuration: c.ComponentConfig.Generic.LeaderElection.LeaseDuration.Duration,
 		RenewDeadline: c.ComponentConfig.Generic.LeaderElection.RenewDeadline.Duration,

@@ -27,6 +27,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"k8s.io/kubernetes/openshift-kube-apiserver/authorization/browsersafe"
+	"k8s.io/kubernetes/openshift-kube-apiserver/authorization/minimumkubeletversion"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	authzconfig "k8s.io/apiserver/pkg/apis/apiserver"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -41,6 +44,7 @@ import (
 	webhookmetrics "k8s.io/apiserver/plugin/pkg/authorizer/webhook/metrics"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/auth/authorizer/abac"
+	"k8s.io/kubernetes/pkg/auth/nodeidentifier"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 	"k8s.io/kubernetes/pkg/util/filesystem"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/node"
@@ -58,10 +62,11 @@ type reloadableAuthorizerResolver struct {
 	reloadInterval         time.Duration
 	requireNonWebhookTypes sets.Set[authzconfig.AuthorizerType]
 
-	nodeAuthorizer *node.NodeAuthorizer
-	rbacAuthorizer *rbac.RBACAuthorizer
-	abacAuthorizer abac.PolicyList
-	compiler       authorizationcel.Compiler // non-nil and shared across reloads.
+	nodeAuthorizer         *node.NodeAuthorizer
+	rbacAuthorizer         *rbac.RBACAuthorizer
+	scopeLimitedAuthorizer authorizer.Authorizer
+	abacAuthorizer         abac.PolicyList
+	compiler               authorizationcel.Compiler // non-nil and shared across reloads.
 
 	lastLoadedLock   sync.Mutex
 	lastLoadedConfig *authzconfig.AuthorizationConfiguration
@@ -94,9 +99,11 @@ func (r *reloadableAuthorizerResolver) newForConfig(authzConfig *authzconfig.Aut
 		ruleResolvers []authorizer.RuleResolver
 	)
 
-	// Add SystemPrivilegedGroup as an authorizing group
-	superuserAuthorizer := authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup)
-	authorizers = append(authorizers, superuserAuthorizer)
+	if !skipSystemMastersAuthorizer {
+		// Add SystemPrivilegedGroup as an authorizing group
+		superuserAuthorizer := authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup)
+		authorizers = append(authorizers, superuserAuthorizer)
+	}
 
 	for _, configuredAuthorizer := range authzConfig.Authorizers {
 		// Keep cases in sync with constant list in k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes/modes.go.
@@ -169,8 +176,24 @@ func (r *reloadableAuthorizerResolver) newForConfig(authzConfig *authzconfig.Aut
 			if r.rbacAuthorizer == nil {
 				return nil, nil, fmt.Errorf("authorizer type RBAC is not allowed if it was not enabled at initial server startup")
 			}
-			authorizers = append(authorizers, authorizationmetrics.InstrumentedAuthorizer(string(configuredAuthorizer.Type), configuredAuthorizer.Name, r.rbacAuthorizer))
+			// Wrap with an authorizer that detects unsafe requests and modifies verbs/resources appropriately so policy can address them separately
+			authorizers = append(authorizers, authorizationmetrics.InstrumentedAuthorizer(string(configuredAuthorizer.Type), configuredAuthorizer.Name, browsersafe.NewBrowserSafeAuthorizer(r.rbacAuthorizer, user.AllAuthenticated)))
 			ruleResolvers = append(ruleResolvers, r.rbacAuthorizer)
+		case authzconfig.AuthorizerType(modes.ModeScope):
+			// Wrap with an authorizer that detects unsafe requests and modifies verbs/resources appropriately so policy can address them separately
+			authorizers = append(authorizers, browsersafe.NewBrowserSafeAuthorizer(r.scopeLimitedAuthorizer, user.AllAuthenticated))
+		case authzconfig.AuthorizerType(modes.ModeSystemMasters):
+			// no browsersafeauthorizer here becase that rewrites the resources.  This authorizer matches no matter which resource matches.
+			authorizers = append(authorizers, authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup))
+		case authzconfig.AuthorizerType(modes.ModeMinimumKubeletVersion):
+			// Add MinimumKubeletVerison authorizer, to block a node from being able to access most resources if it's not new enough.
+			// We must do so here instead of in pkg/apiserver because it relies on a node informer, which is not present in generic control planes.
+			authorizers = append(authorizers, minimumkubeletversion.NewMinimumKubeletVersion(
+				GetMinimumKubeletVersion(),
+				nodeidentifier.NewDefaultNodeIdentifier(),
+				r.initialConfig.VersionedInformerFactory.Core().V1().Nodes().Informer(),
+				r.initialConfig.VersionedInformerFactory.Core().V1().Nodes().Lister(),
+			))
 		default:
 			return nil, nil, fmt.Errorf("unknown authorization mode %s specified", configuredAuthorizer.Type)
 		}
